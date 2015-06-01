@@ -14,15 +14,19 @@
  * limitations under the License.
  */
 
-var utils = require('../lib/utils'),
+var async = require('async'),
+    utils = require('../lib/utils'),
     lineReader = require('line-reader'),
     sleep = require('sleep');
 
 var argv = utils.config({
     demand: ['table'],
-    optional: ['rate', 'key', 'secret', 'region'],
+    optional: ['rate', 'key', 'secret', 'region', 'report', 'skip'],
+    default: {
+        skip: 0
+    }
     usage: 'Restores Dynamo DB table from JSON file\n' +
-        'Usage: dynamo-restore --table my-table [--rate 100] [--region us-east-1] [--key AK...AA] [--secret 7a...IG] filename'
+        'Usage: dynamo-restore --table my-table [--rate 100] [--skip 0] [--region us-east-1] [--key AK...AA] [--secret 7a...IG] filename'
 });
 
 var dynamo = utils.dynamo(argv);
@@ -38,15 +42,23 @@ dynamo.describeTable(
             throw 'Table ' + argv.table + ' not found in DynamoDB';
         }
         var quota = data.Table.ProvisionedThroughput.WriteCapacityUnits,
-            msecPerItem = Math.round(1000 / quota / ((argv.rate || 100) / 100)),
-            reportPeriod = argv.reportPeriod || 1000,
-            filename = argv._[0],
-            start = Date.now(),
+            portion = [],
+            skipped = 0,
             done = 0;
 
-        if (!filename) throw new Error('Last argument is filename, it`s required');
+        if (!argv.filename) throw new Error('Last argument is filename, it`s required');
 
-        lineReader.eachLine(filename, function (line, last, callback) {
+        console.log(
+            'Restoring table', argv.table, 'from file', argv.filename, 'quota:', quota);
+        if (argv.skip) console.log('Skipping ', argv.skip, 'rows...');
+
+        lineReader.eachLine(argv.filename, function (line, last, callback) {
+                if (skipped < argv.skip) {
+                    skipped++;
+                    if (skipped % quota == 0) done++;
+                    return callback();
+                }
+
                 var object = {};
                 line = JSON.parse(line);
                 for (var i in line) {
@@ -54,28 +66,36 @@ dynamo.describeTable(
                     if (object[i].B) object[i].B = new Buffer(object[i].B);
                 }
 
-                dynamo.putItem(
-                    {
-                        TableName: argv.table,
-                        Item: object
-                    },
-                    function (err) {
-                        object = undefined;
-                        if (err) {
-                            console.log(err, err.stack);
-                            throw err;
-                        }
+                portion.push(object);
+                if (portion.length < quota) return callback();
 
-                        ++done;
-                        if (done % reportPeriod == 0) console.log('Done:', done);
-                        var expected = start + msecPerItem * done;
-                        if (expected > Date.now()) {
-                            sleep.usleep((expected - Date.now()) * 1000);
-                        }
-                        callback();
-                    }
-                );
+                saveItems(dynamo, argv.table, portion, function(err) {
+                    if (err) throw err;
+
+                    done++;
+                    console.log('Portion #', done, 'sent. Rows count:', done * quota);
+                    callback();
+                });
             }
         );
     }
 );
+
+function saveItems(dynamo, table, items, callback) {
+    var start = new Date().getTime();
+    async.each(items, function(item, callback) {
+        dynamo.putItem(
+            {
+                TableName: table,
+                Item: item
+            },
+            callback
+        );
+    }, function(err) {
+        if (err) return callback(err);
+
+        var sleepTime = (1000 - (new Date().getTime() - start));
+        sleep.usleep(Math.max(sleepTime * 1100, 0));
+        callback();
+    });
+}
