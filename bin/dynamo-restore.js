@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Copyright 2013 Yegor Bugayenko
+ * Copyright 2013 Yegor Bugayenko, 2015 Dmitriy Mozgovoy, Playkot
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,15 +14,15 @@
  * limitations under the License.
  */
 
-var utils = require('../lib/utils');
-var readline = require('readline');
-var sleep = require('sleep');
+var utils = require('../lib/utils'),
+    lineReader = require('line-reader'),
+    sleep = require('sleep');
 
 var argv = utils.config({
     demand: ['table'],
     optional: ['rate', 'key', 'secret', 'region'],
     usage: 'Restores Dynamo DB table from JSON file\n' +
-           'Usage: dynamo-archive --table my-table [--rate 100] [--region us-east-1] [--key AK...AA] [--secret 7a...IG]'
+        'Usage: dynamo-restore --table my-table [--rate 100] [--region us-east-1] [--key AK...AA] [--secret 7a...IG] filename'
 });
 
 var dynamo = utils.dynamo(argv);
@@ -37,30 +37,44 @@ dynamo.describeTable(
         if (data == null) {
             throw 'Table ' + argv.table + ' not found in DynamoDB';
         }
-        var quota = data.Table.ProvisionedThroughput.WriteCapacityUnits;
-        var start = Date.now();
-        var msecPerItem = Math.round(1000 / quota / ((argv.rate || 100) / 100));
-        var done = 0;
-        readline.createInterface(process.stdin, process.stdout).on(
-            'line',
-            function(line) {
+        var quota = data.Table.ProvisionedThroughput.WriteCapacityUnits,
+            msecPerItem = Math.round(1000 / quota / ((argv.rate || 100) / 100)),
+            reportPeriod = argv.reportPeriod || 1000,
+            filename = argv._[0],
+            start = Date.now(),
+            done = 0;
+
+        if (!filename) throw new Error('Last argument is filename, it`s required');
+
+        lineReader.eachLine(filename, function (line, last, callback) {
+                var object = {};
+                line = JSON.parse(line);
+                for (var i in line) {
+                    object[i] = line[i];
+                    if (object[i].B) object[i].B = new Buffer(object[i].B);
+                }
+
                 dynamo.putItem(
                     {
                         TableName: argv.table,
-                        Item: JSON.parse(line)
+                        Item: object
                     },
-                    function (err, data) {
+                    function (err) {
+                        object = undefined;
                         if (err) {
                             console.log(err, err.stack);
                             throw err;
                         }
+
+                        ++done;
+                        if (done % reportPeriod == 0) console.log('Done:', done);
+                        var expected = start + msecPerItem * done;
+                        if (expected > Date.now()) {
+                            sleep.usleep((expected - Date.now()) * 1000);
+                        }
+                        callback();
                     }
                 );
-                ++done;
-                var expected = start + msecPerItem * done;
-                if (expected > Date.now()) {
-                    sleep.usleep((expected - Date.now()) * 1000);
-                }
             }
         );
     }
