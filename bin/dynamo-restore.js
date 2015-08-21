@@ -24,7 +24,7 @@ var argv = utils.config({
     optional: ['rate', 'key', 'secret', 'region', 'report', 'skip'],
     default: {
         skip: 0
-    }
+    },
     usage: 'Restores Dynamo DB table from JSON file\n' +
         'Usage: dynamo-restore --table my-table [--rate 100] [--skip 0] [--region us-east-1] [--key AK...AA] [--secret 7a...IG] filename'
 });
