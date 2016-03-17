@@ -15,19 +15,23 @@
  */
 
 var async = require('async'),
+    util = require('util'),
     utils = require('../lib/utils'),
     lineReader = require('line-reader'),
     sleep = require('sleep');
 
 var argv = utils.config({
     demand: ['table'],
-    optional: ['rate', 'key', 'secret', 'region', 'report', 'skip'],
+    optional: ['rate', 'key', 'secret', 'region', 'report', 'skip', 'batch'],
     default: {
         skip: 0
     },
     usage: 'Restores Dynamo DB table from JSON file\n' +
-        'Usage: dynamo-restore --table my-table [--rate 100] [--skip 0] [--region us-east-1] [--key AK...AA] [--secret 7a...IG] filename'
+        'Usage: dynamo-restore --table my-table [--rate 100] [--skip 0] [--region us-east-1] [--key AK...AA] [--secret 7a...IG] [--batch] filename'
 });
+
+var BATCH_MAX_SIZE = 25;
+var WRITE_UNIT_SIZE = 1024;
 
 var dynamo = utils.dynamo(argv);
 dynamo.describeTable(
@@ -43,12 +47,21 @@ dynamo.describeTable(
         }
         var quota = data.Table.ProvisionedThroughput.WriteCapacityUnits,
             portion = [],
+            units = 0,
             skipped = 0,
-            done = 0;
+            done = 0,
+            writtenRows = 0;
 
         if (!argv.filename) throw new Error('Last argument is filename, it`s required');
 
-        console.log(new Date(), 'Restoring table', argv.table, 'from file', argv.filename, 'quota:', quota);
+        console.log(util.format(
+            '[%s]: Restoring table %s from file %s. Write capacity quota: %d',
+            new Date(),
+            argv.table,
+            argv.filename,
+            quota
+        ));
+
         if (argv.skip) console.log('Skipping ', argv.skip, 'rows...');
 
         lineReader.eachLine(argv.filename, function (line, last, callback) {
@@ -62,27 +75,57 @@ dynamo.describeTable(
                 line = JSON.parse(line);
                 for (var i in line) {
                     object[i] = line[i];
-                    if (object[i].B) object[i].B = new Buffer(object[i].B);
+                    var size;
+                    if (object[i].B) {
+                        object[i].B = new Buffer(object[i].B);
+                        size = Math.ceil(object[i].B.length/WRITE_UNIT_SIZE);
+                    } else {
+                        size = Math.ceil(Buffer.byteLength(line[i], 'utf-8')/WRITE_UNIT_SIZE);
+                    }
+
+                    units += size;
+                    if (argv.batch && size >= 400) {
+                        return callback(new Error('UNable to use batch processing for items bigger than 400KB'));
+                    }
                 }
 
                 portion.push(object);
-                if (portion.length < quota) return callback();
+                if (units < quota) return callback();
 
-                saveItems(dynamo, argv.table, portion, function(err) {
+                var start = new Date().getTime();
+                var onSave = function(err) {
                     if (err) throw err;
 
                     done++;
-                    console.log(new Date(), 'Portion #', done, 'sent. Rows count:', done * quota);
+                    writtenRows += portion.length;
+
+                    console.log(util.format(
+                        '[%s]: Portion #%d is done. Items written: %d. Items written overall: %d',
+                        new Date(),
+                        done,
+                        portion.length,
+                        writtenRows
+                    ));
+
+                    units = 0;
                     portion = [];
+
+                    var sleepTime = (1000 - (new Date().getTime() - start));
+                    sleep.usleep(Math.max(sleepTime * 1100, 0));
                     callback();
-                });
+                };
+
+                if (argv.batch) {
+                    batchSaveItems(dynamo, argv.table, portion, onSave);
+                } else {
+                    saveItems(dynamo, argv.table, portion, onSave);
+                }
             }
         );
     }
 );
 
 function saveItems(dynamo, table, items, callback) {
-    var start = new Date().getTime();
     async.each(items, function(item, callback) {
         dynamo.putItem(
             {
@@ -91,11 +134,44 @@ function saveItems(dynamo, table, items, callback) {
             },
             callback
         );
-    }, function(err) {
-        if (err) return callback(err);
+    }, callback);
+}
 
-        var sleepTime = (1000 - (new Date().getTime() - start));
-        sleep.usleep(Math.max(sleepTime * 1100, 0));
-        callback();
+function batchSaveItems(dynamo, table, items, callback) {
+    var portions = [];
+    for (var i=0; i<=items.length/BATCH_MAX_SIZE; i++) {
+        portions.push(items.slice(i * BATCH_MAX_SIZE, (i+1) * BATCH_MAX_SIZE));
+    }
+
+    async.each(portions, function(portion, callback) {
+        if (!portion.length) return callback();
+        makeBatchWriteRequest(dynamo, table, portion, callback);
+    }, callback);
+}
+
+function makeBatchWriteRequest(dynamo, table, items, callback) {
+    if (!items.length) return callback(new Error('Items arg should be an array'));
+    if (items.length > BATCH_MAX_SIZE) return callback(new Error('Items arg is larger than 25 items (' + items.length + ')'));
+
+    var params = {
+        RequestItems: {}
+    };
+    params.RequestItems[table] = [];
+
+    for (var i in items) {
+        params.RequestItems[table].push({
+            PutRequest: {
+                Item: items[i]
+            }
+        });
+    }
+
+    dynamo.batchWriteItem(params, function(err, result) {
+        if (err) return callback(err);
+        if (!result.UnprocessedItems[table]) return callback();
+
+        dynamo.batchWriteItem({
+            RequestItems: result.UnprocessedItems
+        }, callback);
     });
 }
