@@ -48,8 +48,7 @@ dynamo.describeTable(
 
         if (!argv.filename) throw new Error('Last argument is filename, it`s required');
 
-        console.log(
-            'Restoring table', argv.table, 'from file', argv.filename, 'quota:', quota);
+        console.log(new Date(), 'Restoring table', argv.table, 'from file', argv.filename, 'quota:', quota);
         if (argv.skip) console.log('Skipping ', argv.skip, 'rows...');
 
         lineReader.eachLine(argv.filename, function (line, last, callback) {
@@ -73,7 +72,8 @@ dynamo.describeTable(
                     if (err) throw err;
 
                     done++;
-                    console.log('Portion #', done, 'sent. Rows count:', done * quota);
+                    console.log(new Date(), 'Portion #', done, 'sent. Rows count:', done * quota);
+                    portion = [];
                     callback();
                 });
             }
